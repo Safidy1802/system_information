@@ -1,0 +1,387 @@
+var adData, adVisible = false, adTracking = {};
+
+if (!Enabler.isInitialized()) {
+  Enabler.addEventListener(studio.events.StudioEvent.INIT, enablerInitialized);
+} else {
+  enablerInitialized();
+}
+
+function enablerInitialized() {
+  fetchDynamicData();
+//  if (!Enabler.isVisible()) {
+//    Enabler.addEventListener(studio.events.StudioEvent.VISIBLE, adIsVisible);
+//  } else {
+    adIsVisible();
+//  }
+}
+
+function adIsVisible() {
+  Enabler.counter('Visible');
+  adVisible = true;
+  if (adData) {
+    adInit();
+  }
+}
+
+function fetchDynamicData() {
+
+  if (Enabler.getParameter('sfeir_preview') === 'true') {  // We are in SFEIR preview page
+
+    console.log("creativeId", Enabler.getDartCreativeId());
+    var payload = JSON.parse(Enabler.getParameter("payload"));
+    console.log("payload", payload);
+    window.dynamicContent.Profile = window.dynamicContent.Profile || [{ }];
+    // Override destinations with the ones from the preview page
+    window.dynamicContent[configuration.destFeedName] = payload.flights;
+    window.dynamicContent.Preview_Locale = payload.Preview_Locale;
+    dynamicDataReceived();
+
+  } else if (window.dynamicContent) { // We are served by Google Campaign Manager
+    dynamicDataReceived();
+  } else if(isBannerValidation) {
+    // banner validation page takes care of startPreview
+  } else { // We are just previewed in a browser
+    startPreview();
+  }
+}
+
+function chooseLocale(rawDataLocales) {
+  // Get browser locales
+  var languages = navigator.languages ? navigator.languages : (navigator.language ? [navigator.language] : [])
+  var userLocales = languages.map(parseLocale).filter(hasValue);
+  var dataLocales = rawDataLocales.map(parseLocale).filter(hasValue);
+  //Try to find the exact language+country match in data feed
+  var localeWithSameLanguage, matchingLocale;
+  userLocales.forEach(function (userLocale) {
+    dataLocales.forEach(function (dataLocale) {
+      if (dataLocale[0] === userLocale[0]) {
+        if (!matchingLocale && dataLocale[1] === userLocale[1]) {
+          matchingLocale = dataLocale[2];
+        } else if (!localeWithSameLanguage) {
+          localeWithSameLanguage = dataLocale[2];
+        }
+      }
+    });
+  });
+  // return matching locale, else locale with the same language else the first one in data
+  return matchingLocale || localeWithSameLanguage || dataLocales[0][2];
+}
+
+function dynamicDataReceived() {
+  var receivedData = window.dynamicContent;
+  Enabler.counter('Data received');
+  var profile = receivedData.Profile[0];
+  var acqDests = receivedData[configuration.destFeedName]
+    .map(function(d){return tryParseJSON(d.Dest_JSON);})
+    .filter(hasValue)
+    .sort(function (d1, d2) { return d1.Position - d2.Position; });
+
+  // Override destination locale with Preview Locale
+  var overridenLocale = Enabler.getParameter('locale');
+
+  var locale = chooseLocale( (overridenLocale || receivedData.Preview_Locale || acqDests[0].Default_Lang).split(',') );
+  var defaultTranslations = receivedData.translations.filter(function(t){ return t.Language.toString() === 'default'; })[0] || {Airports:"{}"};
+  var translations = receivedData.translations.filter(function(t){ return t.Language.toString() === locale; })[0];
+  if(!translations){
+    // Bad situation : translation is not available for the locales requested in the OD
+    Enabler.counter('Missing translation');
+    translations = receivedData.translations.filter(function(t){ return t.Language.toString().indexOf('.')<0; })[0];
+  }
+
+  var dests = [];
+  var urls;
+  if(profile.IS_RETARGETING === 'TRUE'){
+    var profileFeedConfig = receivedData["market"] ? receivedData["market"][0] : receivedData[" market"][0];
+    var rawDest = receivedData.Klm_feed_profiles_destinations[0];
+    var departure = rawDest.OrgCode;
+    var mainDestCode = rawDest.DestCode[0];
+
+    if( departure !== 'Default' && +rawDest.Amount > 0) {
+      var echoCountry = profile.echoCountry[0] || '';
+      var echoLanguage = profile.echoLanguage[0] || '';
+      var websiteCode = profileFeedConfig.website_code || '.fr';
+      var url = appendToUrl('https://wwws.airfrance'+websiteCode+profile.baseUrl,
+        { 'country': echoCountry, 'language': echoLanguage,
+          'connections': departure+'>'+mainDestCode+'-'+mainDestCode+'>'+departure,
+          'pax': '1:0:0:0:0:0:0:0', 'cabinClass': 'ECONOMY', 'target': 'search' });
+      var dest = {
+        Default_Lang: locale,
+        LP_URL: url,
+        Departure: departure,
+        Destination: mainDestCode,
+        Price: +rawDest.Amount,
+        Thousands: profileFeedConfig.Thousands,
+        Price_format: parsePriceFormat(profileFeedConfig.Price_format),
+        Currency: cleanCurrency(echoCountry, rawDest.Currency),
+        A_R: rawDest.JourneyType === 'Return',
+        Campaign_Name: profile.campaign
+      };
+      dest['Dest_Image_' + configuration.size] = receivedData.destination_images[0]['Dest_Image_' + configuration.size].replace('["','').replace('"]','');
+      dests = [dest];
+    }
+  }
+
+  // Get, parse and sort all destinations
+  if(dests.length === 0){
+    dests = acqDests;
+    if(profile.IS_RETARGETING === 'TRUE') {
+      // change the source of image to destination images instead of prospecting as we are single destination in remarketing
+      dests[0]['Dest_Image_' + configuration.size] = dests[0]['Dest_Image_' + configuration.size].replace("/assets/4122813/", "/assets/4015783/");
+    }
+    urls = tryParseJSON( dests[0].LP_URL );
+  }
+
+  adData = {
+    translations: tryParseJSON(translations.JSON),
+    airports: Object.assign(tryParseJSON(defaultTranslations.Airports), tryParseJSON(translations.Airports)),
+    jsonMetatemplate: tryParseJSON(receivedData.scenario[0]._json),
+    placeholders: {}
+  };
+
+  var uspImg = adData.translations[dests[0].uspCode + '_IMG'];
+  uspImg = uspImg ? uspImg : 'img/background-blue8.jpg';
+  var dateUntil;
+  if(dests[0].Until){
+    dateUntil = (new Date(+dests[0].Until)).toLocaleDateString(locale.replace('_', '-'));
+    dateUntil = dateUntil.replace('-', '&#65279;-&#65279;');
+  }
+
+  var priceDesign = parsePriceFormat(dests[0].Price_format);
+  var desti1amount = formatNumber(+dests[0].Price, dests[0].Thousands);
+  var desti1currency = formatCurrency(priceDesign, dests[0].Currency, isAsianLanguage(locale));
+
+  adData.placeholders = {
+    size: configuration.size,
+    baseImg: profile.baseImg,
+    city: adData.airports[dests[0].Departure],
+    date: dateUntil,
+    desti1: adData.airports[dests[0].Destination],
+    priceDesign: priceDesign,
+    desti1amount: desti1amount,
+    desti1currency: desti1currency,
+    desti1price: formatPrice(desti1amount, desti1currency, priceDesign),
+    desti1type: ensureBoolean(dests[0].A_R) ? adData.translations['ROUND_TRIP'] : adData.translations['SIMPLE_TRIP'],
+    desti1image: dests[0]['Dest_Image_' + configuration.size],
+    uspIcon: adData.translations[dests[0].uspCode + '_ICON'],
+    uspImg:  uspImg,
+    uspTxt1: adData.translations[dests[0].uspCode + '_TXT1'],
+    uspTxt2: adData.translations[dests[0].uspCode + '_TXT2'],
+    uspMl:   adData.translations[dests[0].uspCode + '_ML']
+  };
+
+  if(dests.length >= 2 && hasValue(dests[1].Destination)){
+    adData.placeholders.desti2 = adData.airports[dests[1].Destination];
+    adData.placeholders.desti2amount = formatNumber(+dests[1].Price, dests[1].Thousands);
+    adData.placeholders.desti2currency = formatCurrency(parsePriceFormat(dests[1].Price_format), dests[1].Currency, isAsianLanguage(locale));
+    adData.placeholders.desti2price = formatPrice(adData.placeholders.desti2amount, adData.placeholders.desti2currency, priceDesign);
+    adData.placeholders.desti2type = ensureBoolean(dests[1].A_R) ? adData.translations['ROUND_TRIP'] : adData.translations['SIMPLE_TRIP'];
+    adData.placeholders.desti2image = dests[1]['Dest_Image_' + configuration.size];
+  }
+
+  if(dests.length >= 3 && hasValue(dests[2].Destination)){
+    adData.placeholders.desti3 = adData.airports[dests[2].Destination];
+    adData.placeholders.desti3amount = formatNumber(+dests[2].Price, dests[2].Thousands);
+    adData.placeholders.desti3currency = formatCurrency(parsePriceFormat(dests[2].Price_format), dests[2].Currency, isAsianLanguage(locale));
+    adData.placeholders.desti3price = formatPrice(adData.placeholders.desti3amount, adData.placeholders.desti3currency, priceDesign);
+    adData.placeholders.desti3type = ensureBoolean(dests[2].A_R) ? adData.translations['ROUND_TRIP'] : adData.translations['SIMPLE_TRIP'];
+    adData.placeholders.desti3image = dests[2]['Dest_Image_' + configuration.size];
+  }
+
+  var campaign = (dests[0].Campaign_Name || dests[0].campaign_name || 'no-campaign')+'//'+receivedData.scenario[0]._scenario;
+  var exitUrl = urls ? urls[locale] : dests[0].LP_URL;    // JSON Object by locale for URL or Single URL for destination
+  initTracking(campaign, exitUrl);
+
+  if(adVisible){
+    adInit();
+  }
+}
+
+function adInit() {
+  Enabler.counter('Started');
+  console.log('adInit', adData);
+  ADventori.initData(combine(adData.jsonMetatemplate, adData.placeholders, adData.translations));
+  startAd();
+}
+
+function adClicked() {
+  if (!adTracking.initialized) {
+    Enabler.counter('Clicked before tracking init');
+  } else {
+    Enabler.exitOverride('Click', adTracking.clickUrl);
+  }
+}
+
+function initTracking(campaignName, url) {
+  var countryParam = Enabler.getParameter('country');
+  var userCountry = Enabler.getUserCountry() ? Enabler.getUserCountry() : 'ZZ';
+  adTracking.medium = 'DSP';
+  adTracking.source = Enabler.getParameter('source') || '';
+  adTracking.campaign = Enabler.getParameter('af-creative-id') || '';
+  adTracking.content = ((!countryParam || countryParam === 'AUTO') ? userCountry : countryParam) + '_' + campaignName;
+  adTracking.term = Enabler.getParameter('af-campaign-id') || '';
+  adTracking.initialized = true;
+
+  var wizJsUrl = appendToUrl('https://tk.airfrance.fr/50153/tagv_50153_13.js', {
+    'wiz_medium': adTracking.medium,
+    'wiz_source': adTracking.source,
+    'wiz_campaign': adTracking.campaign,
+    'wiz_content': adTracking.content,
+    'wiz_term': adTracking.term
+  });
+
+  if (Enabler.isServingInLiveEnvironment()) {
+    var wizScript = document.createElement('script');
+    wizScript.id = 'esvtagv_50153_13';
+    wizScript.type = 'text/javascript';
+    wizScript.defer = true;
+    wizScript.async = true;
+    wizScript.src = wizJsUrl.split('?')[0];
+    wizScript.setAttribute('data-parameters', wizJsUrl.split('?')[1]);
+    document.body.appendChild(wizScript);
+  } else {
+    console.log('Tracking js', wizJsUrl);
+  }
+
+  adTracking.clickUrl = appendToUrl(url, {
+    'utm_medium': adTracking.medium,
+    'utm_source': adTracking.source,
+    'utm_campaign': adTracking.campaign,
+    'utm_content': adTracking.content,
+    'utm_term': adTracking.term
+  });
+}
+
+function parseLocale(locale) {
+  const parts = locale.trim().split(/[-_]/);
+  if (parts.length === 1) {
+    return [parts[0].toLowerCase(), null, parts[0].toLowerCase()];
+  } else if (parts.length === 2) {
+    return [parts[0].toLowerCase(), parts[1].toUpperCase(), parts[0].toLowerCase() + '_' + parts[1].toUpperCase()];
+  } else {
+    return;
+  }
+}
+
+function isAsianLanguage(locale) {
+  var lang = locale.trim().toLowerCase();
+  return  lang.indexOf('ko') >= 0 || lang.indexOf('tw') >= 0 || lang.indexOf('zh') >= 0 || lang.indexOf('ja') >= 0;
+}
+
+function appendToUrl(url, parameters){
+  var qs = '';
+  for(var key in parameters) {
+    qs += '&' + encodeURIComponent(key) + '=' + encodeURIComponent(parameters[key]);
+  }
+  if (qs.length > 0){
+    if( url.indexOf('?')>0 ){
+      return url + qs;
+    } else {
+      return url + '?' + qs.substring(1, qs.length);
+    }
+  } else {
+    return url;
+  }
+}
+
+function tryParseJSON (str) {
+  try {
+    return JSON.parse(str);
+  } catch (e) {}
+}
+
+function ensureBoolean(v) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') {
+    if (v.trim().toLowerCase() === 'true') return true;
+    if (v.trim().toLowerCase() === 'false') return false;
+  }
+  return undefined;
+}
+
+function parsePriceFormat (format) {
+  // HACK because GG is removing %s in strings
+  if (format === '%v ') return 'currencyRight';
+  if (format === ' %v') return 'currencyLeft';
+  // END OF HACK because GG is removing %s in strings
+  var cleanFormat = format.replace(/[,\s]+/g, '').toLowerCase();
+  if (cleanFormat === '%v%s' || cleanFormat === '%v') return 'currencyRight';
+  if (cleanFormat === '%s%v') return 'currencyLeft';
+  return undefined;
+}
+
+function formatNumber(value, thousandSeparator) {
+  var valueStr = value.toFixed(0);
+  var formattedValue = '';
+  for (var i = 0; i < valueStr.length; i++) {
+    var position = valueStr.length - i;
+    if (position % 3 === 0 && i !== 0) formattedValue += thousandSeparator;
+    formattedValue += valueStr.charAt(i);
+  }
+  return formattedValue;
+}
+
+function formatCurrency(display, symbol, asian) {
+  return asian ? symbol : (display === 'currencyLeft' ? symbol + ' ' : ' ' + symbol) ;
+}
+
+function formatPrice(formattedPrice, formattedCurrency, display) {
+  return display === 'currencyLeft' ? formattedCurrency + formattedPrice : formattedPrice + formattedCurrency ;
+}
+
+function cleanCurrency (market, currency) {
+  var currencyFixer = {
+    'AE': {'devise': 'AED', 'showdevise': 'AED'},
+    'AM': {'devise': 'EUR', 'showdevise': '€'},
+    'AO': {'devise': 'USD', 'showdevise': 'USD'},
+    'AR': {'devise': 'USD', 'showdevise': 'US$'},
+    'AU': {'devise': 'AUD', 'showdevise': 'AUD'},
+    'BF': {'devise': 'XOF', 'showdevise': 'XOF'},
+    'BR': {'devise': 'BRL', 'showdevise': 'R$'},
+    'CA': {'devise': 'CAD', 'showdevise': '$'},
+    'CG': {'devise': 'XOF', 'showdevise': 'FCFA'},
+    'CH': {'devise': 'CHF', 'showdevise': 'CHF'},
+    'CL': {'devise': 'CLP', 'showdevise': 'CLP'},
+    'CN': {'devise': 'CNY', 'showdevise': '¥'},
+    'CZ': {'devise': 'CZK', 'showdevise': 'CZK'},
+    'DK': {'devise': 'DKK', 'showdevise': ',-'},
+    'DO': {'devise': 'DOP', 'showdevise': 'DOP'},
+    'DZ': {'devise': 'DZD', 'showdevise': 'da'},
+    'EG': {'devise': 'EGP', 'showdevise': 'EGP'},
+    'GB': {'devise': 'GBP', 'showdevise': '£'},
+    'HK': {'devise': 'HKD', 'showdevise': 'HKD'},
+    'HU': {'devise': 'HUF', 'showdevise': 'HUF'},
+    'ID': {'devise': 'IDR', 'showdevise': 'IDR'},
+    'IN': {'devise': 'INR', 'showdevise': 'INR'},
+    'JO': {'devise': 'JOD', 'showdevise': 'JD'},
+    'JP': {'devise': 'JPY', 'showdevise': 'JPY'},
+    'KR': {'devise': 'KRW', 'showdevise': 'KRW'},
+    'MA': {'devise': 'MAD', 'showdevise': 'dhs'},
+    'MU': {'devise': 'MUR', 'showdevise': 'MUR'},
+    'MY': {'devise': 'MYR', 'showdevise': 'MYR'},
+    'NC': {'devise': 'XPF', 'showdevise': 'XPF'},
+    'PL': {'devise': 'PLN', 'showdevise': 'PLN'},
+    'RU': {'devise': 'RUB', 'showdevise': 'RUB'},
+    'SA': {'devise': 'SAR', 'showdevise': 'SAR'},
+    'SE': {'devise': 'SEK', 'showdevise': ':-'},
+    'SG': {'devise': 'SGD', 'showdevise': 'SGD'},
+    'TH': {'devise': 'THB', 'showdevise': 'THB'},
+    'TN': {'devise': 'TND', 'showdevise': 'DT'},
+    'ZA': {'devise': 'ZAR', 'showdevise': 'ZAR'}
+  };
+
+  var cuMarket = currencyFixer[market];
+  if (cuMarket) {
+    if (cuMarket.devise === currency) {
+      return cuMarket.showdevise;
+    } else {
+      return currency;
+    }
+  } else {
+    for (var key in currencyFixer) {
+      if (currencyFixer.hasOwnProperty(key) && currencyFixer[key].devise === currency) {
+        return currencyFixer[key].showdevise;
+      }
+    }
+    return currency;
+  }
+}
