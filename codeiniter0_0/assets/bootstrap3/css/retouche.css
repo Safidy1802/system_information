@@ -1,0 +1,18 @@
+#ajout{
+    width:450px;
+    height:fit-content;
+    margin: 2% auto 0 auto;
+    padding: 4% ;
+    border: solid transparent;
+    border-radius: 20px;
+    background-color: rgba(255, 255, 255, 0.904);
+}
+#titre{
+    text-align: center;
+}
+#button{
+    text-align: right;
+}
+body{
+    background-color: hsla(0, 85%, 26%, 0.199);
+}
