@@ -1,0 +1,16 @@
+.breadcrumb-item > a {
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 400;
+  color: #5D5C5B;
+}
+
+.breadcrumb-item img {
+  filter: invert(36%) sepia(5%) saturate(136%) hue-rotate(349deg) brightness(94%) contrast(87%);
+}
+
+.breadcrumb-item.active > a {
+  text-decoration: none;
+  color: #817F7E;
+}
+
